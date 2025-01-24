@@ -99,11 +99,12 @@ void KeyExpansion(uint8_t *RoundKey, const uint8_t *Key)
 
 void AddRoundKey(uint8_t round, uint8_t state[4][4], const uint8_t *RoundKey)
 {
+    const number_of_bytes_in_block = Nb * 4;
     for (uint8_t i = 0; i < 4; i++)
     {
         for (uint8_t j = 0; j < 4; j++)
         {
-            state[j][i] ^= RoundKey[(round * Nb * 4) + (i * 4) + j];
+            state[j][i] ^= RoundKey[(round * number_of_bytes_in_block) + (i * 4) + j];
         }
     }
 }
@@ -160,6 +161,10 @@ uint8_t MultiplyBy3(uint8_t x)
 
 void MixColumns(uint8_t state[4][4])
 {
+    // [ 2  3  1  1 ]   [ s0 ]
+    // [ 1  2  3  1 ] * [ s1 ]
+    // [ 1  1  2  3 ]   [ s2 ]
+    // [ 3  1  1  2 ]   [ s3 ]
     uint8_t temp[4];
     for (uint8_t i = 0; i < 4; i++)
     {
