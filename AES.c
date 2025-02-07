@@ -434,6 +434,9 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
     }
+    struct timespec start, end;
+
+    clock_gettime(CLOCK_MONOTONIC, &start); // Start timing
 
     PrimeSBoxCache(); // Prime the cache with SBOX values
     lock_sbox_in_memory();
@@ -489,6 +492,11 @@ int main(int argc, char *argv[])
     // measure_sbox_access_time();
     flush_sbox_from_cache();
     // measure_sbox_access_time();
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    while (end.tv_sec - start.tv_sec <= 2)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &end);
+    }
 
     return EXIT_SUCCESS;
 }
