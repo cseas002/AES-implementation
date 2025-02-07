@@ -1,22 +1,11 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <getopt.h> // For parsing command-line arguments
 
 #define Nb 4        // Number of culumns. Basically number of words in a block
 #define KEY_WORDS 4 // Number of words in the key. Key size / 32
 #define ROUNDS 10   // Number of rounds. For AES-128 it's always 10
 #define WORD_SIZE 4 // The word size
-
-void PrimeSBoxCache()
-{
-    volatile uint8_t dummy = 0;
-    for (int i = 0; i < 256; i++)
-    {
-        dummy ^= sbox[i]; // Ensure memory access
-    }
-}
 
 void print_hex(const char *label, const uint8_t *data, size_t len)
 {
@@ -193,7 +182,7 @@ void MixColumns(uint8_t state[4][4])
     }
 }
 
-void Cipher(uint8_t *input, uint8_t *output, const uint8_t *RoundKey, int encrypt)
+void Cipher(uint8_t *input, uint8_t *output, const uint8_t *RoundKey)
 {
     uint8_t state[4][4];
 
@@ -206,41 +195,19 @@ void Cipher(uint8_t *input, uint8_t *output, const uint8_t *RoundKey, int encryp
         }
     }
 
-    if (encrypt)
+    AddRoundKey(0, state, RoundKey);
+
+    for (uint8_t round = 1; round < ROUNDS; round++)
     {
-        AddRoundKey(0, state, RoundKey);
-
-        for (uint8_t round = 1; round < ROUNDS; round++)
-        {
-            SubBytes(state);
-            ShiftRows(state);
-            MixColumns(state);
-            AddRoundKey(round, state, RoundKey);
-        }
-
         SubBytes(state);
         ShiftRows(state);
-        AddRoundKey(ROUNDS, state, RoundKey);
+        MixColumns(state);
+        AddRoundKey(round, state, RoundKey);
     }
-    else
-    {
-        // For decryption, we need to start with the last round key
 
-        // I need to implement the inverse of the functions
-        // AddRoundKey(ROUNDS, state, RoundKey);
-        // ShiftRows(state);
-        // SubBytes(state);
-
-        // for (uint8_t round = ROUNDS - 1; round >= 1; round--)
-        // {
-        //     AddRoundKey(round, state, RoundKey);
-        //     MixColumns(state);
-        //     ShiftRows(state);
-        //     SubBytes(state);
-        // }
-
-        // AddRoundKey(0, state, RoundKey);
-    }
+    SubBytes(state);
+    ShiftRows(state);
+    AddRoundKey(ROUNDS, state, RoundKey);
 
     // Copy state to output
     for (uint8_t i = 0; i < 4; i++)
@@ -252,97 +219,126 @@ void Cipher(uint8_t *input, uint8_t *output, const uint8_t *RoundKey, int encryp
     }
 }
 
-// Main function
-int main(int argc, char *argv[])
+void test_KeyExpansion()
 {
-    int opt;
-    int mode_encrypt = -1; // -1 means mode not set, 0 = decrypt, 1 = encrypt
-    const char *input_file_name = NULL;
-    const char *output_file_name = NULL;
-    const char *key_file_name = NULL;
+    uint8_t key[16] = {
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+        0xab, 0xf7, 0xcf, 0x8c, 0x32, 0x88, 0x31, 0x4b};
+    uint8_t roundKey[176];
+
+    KeyExpansion(roundKey, key);
+
+    // Precomputed round keys for the above key
+    uint8_t expectedRoundKey[176] = {
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0xcf, 0x8c, 0x32, 0x88, 0x31, 0x4b,
+        0xa0, 0xfa, 0xfe, 0x17, 0x88, 0x54, 0x2c, 0xb1, 0x23, 0xa3, 0x39, 0x39, 0x2a, 0x6c, 0x76, 0x05,
+        /* Remaining keys omitted for brevity */};
+
+    print_hex("Computed RoundKey", roundKey, 32);
+    print_hex("Expected RoundKey", expectedRoundKey, 32);
+
+    if (memcmp(roundKey, expectedRoundKey, 32) == 0)
+        printf("KeyExpansion: PASS\n");
+    else
+        printf("KeyExpansion: FAIL\n");
+}
+
+void test_SubBytes()
+{
+    uint8_t state[4][4] = {
+        {0x19, 0xa0, 0x9a, 0xe9},
+        {0x3d, 0xf4, 0xc6, 0xf8},
+        {0xe3, 0xe2, 0x8d, 0x48},
+        {0xbe, 0x2b, 0x2a, 0x08}};
+    uint8_t expectedState[4][4] = {
+        {0xd4, 0xe0, 0xb8, 0x1e},
+        {0x27, 0xbf, 0xb4, 0x41},
+        {0x11, 0x98, 0x5d, 0x52},
+        {0xae, 0xf1, 0xe5, 0x30}};
+
+    SubBytes(state);
+
+    print_hex("Computed SubBytes", (uint8_t *)state, 16);
+    print_hex("Expected SubBytes", (uint8_t *)expectedState, 16);
+
+    if (memcmp(state, expectedState, 16) == 0)
+        printf("SubBytes: PASS\n");
+    else
+        printf("SubBytes: FAIL\n");
+}
+
+void test_ShiftRows()
+{
+    uint8_t state[4][4] = {
+        {0xd4, 0xe0, 0xb8, 0x1e},
+        {0x27, 0xbf, 0xb4, 0x41},
+        {0x11, 0x98, 0x5d, 0x52},
+        {0xae, 0xf1, 0xe5, 0x30}};
+    uint8_t expectedState[4][4] = {
+        {0xd4, 0xe0, 0xb8, 0x1e},
+        {0xbf, 0xb4, 0x41, 0x27},
+        {0x5d, 0x52, 0x11, 0x98},
+        {0x30, 0xae, 0xf1, 0xe5}};
+
+    ShiftRows(state);
+
+    print_hex("Computed ShiftRows", (uint8_t *)state, 16);
+    print_hex("Expected ShiftRows", (uint8_t *)expectedState, 16);
+
+    if (memcmp(state, expectedState, 16) == 0)
+        printf("ShiftRows: PASS\n");
+    else
+        printf("ShiftRows: FAIL\n");
+}
+
+void test_MixColumns()
+{
+    uint8_t state[4][4] = {
+        {0xd4, 0xe0, 0xb8, 0x1e},
+        {0xbf, 0xb4, 0x41, 0x27},
+        {0x5d, 0x52, 0x11, 0x98},
+        {0x30, 0xae, 0xf1, 0xe5}};
+    uint8_t expectedState[4][4] = {
+        {0x04, 0xe0, 0x48, 0x28},
+        {0x66, 0xcb, 0xf8, 0x06},
+        {0x81, 0x19, 0xd3, 0x26},
+        {0xe5, 0x9a, 0x7a, 0x4c}};
+
+    MixColumns(state);
+
+    print_hex("Computed MixColumns", (uint8_t *)state, 16);
+    print_hex("Expected MixColumns", (uint8_t *)expectedState, 16);
+
+    if (memcmp(state, expectedState, 16) == 0)
+        printf("MixColumns: PASS\n");
+    else
+        printf("MixColumns: FAIL\n");
+}
+
+int main()
+{
+    uint8_t key[16];       // 16 bytes for the key
     uint8_t roundKey[176]; // Nb * (ROUNDS + 1)
     uint8_t input[16];     // 16 bytes for the input, which is the key + 16 bytes for the every block
     uint8_t output[16];    // 16 bytes for the output, same idea as above
-    uint8_t key[16];       // 16 bytes for the key
 
-    // Parse command-line arguments
-    while ((opt = getopt(argc, argv, "i:o:k:ed")) != -1)
-    {
-        switch (opt)
-        {
-        case 'i': // Input file
-            input_file_name = optarg;
-            break;
-        case 'o': // Output file
-            output_file_name = optarg;
-            break;
-        case 'k': // Key file
-            key_file_name = optarg;
-            break;
-        case 'e': // Encryption mode
-            mode_encrypt = 1;
-            break;
-        case 'd': // Decryption mode
-            mode_encrypt = 0;
-            break;
-        default:
-            fprintf(stderr, "Usage: %s -i <input_file> -o <output_file> -k <key_file> -e|-d\n", argv[0]);
-            return EXIT_FAILURE;
-        }
-    }
+    // printf("=== Running AES Component Tests ===\n");
 
-    PrimeSBoxCache(); // Prime the cache with SBOX values
+    // test_KeyExpansion();
+    // test_SubBytes();
+    // test_ShiftRows();
+    // test_MixColumns();
 
-    if (input_file_name == NULL && output_file_name == NULL && key_file_name == NULL && mode_encrypt == -1)
-    {
-        printf("Reading from input, with key+payload: \n");
-        // Read key from standard input
-        fread(key, 1, 16, stdin); // 1 is the size of each element, here it's one byte, total of 16 bytes
-        KeyExpansion(roundKey, key);
-
-        // Read and encrypt blocks
-        while (fread(input, 1, 16, stdin) == 16)
-        {
-            Cipher(input, output, roundKey, 1);
-            fwrite(output, 1, 16, stdout);
-        }
-
-        return 0;
-    }
-
-    // Validate required arguments
-    if (input_file_name == NULL || output_file_name == NULL || key_file_name == NULL || mode_encrypt == -1)
-    {
-        fprintf(stderr, "Usage: %s -i <input_file> -o <output_file> -k <key_file> -e|-d\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    FILE *key_file = fopen(key_file_name, "rb");       // Open the key file in binary mode
-    FILE *input_file = fopen(input_file_name, "rb");   // Open the key file in binary mode
-    FILE *output_file = fopen(output_file_name, "wb"); // Open the key file in binary mode
-    if (!(key_file && input_file && output_file))
-    {
-        fprintf(stderr, "Error: Could not open files \n");
-        return EXIT_FAILURE; // Exit if the file could not be opened
-    }
-
-    // printf("%s %s %s %d\n", input_file_name, output_file_name, key_file_name, mode_encrypt);
-
-    // return 0;
-
-    // Read key from the key file
-    fread(key, 1, 16, key_file); // 1 is the size of each element, here it's one byte, total of 16 bytes
+    // Read key from standard input
+    fread(key, 1, 16, stdin); // 1 is the size of each element, here it's one byte, total of 16 bytes
     KeyExpansion(roundKey, key);
 
-    // // Reset the file pointer to the beginning
-    // fseek(input_file_name, 0, SEEK_SET);
-
     // Read and encrypt blocks
-    while (fread(input, 1, 16, input_file) == 16)
+    while (fread(input, 1, 16, stdin) == 16)
     {
-        Cipher(input, output, roundKey, mode_encrypt);
-        fwrite(output, 1, 16, output_file);
+        Cipher(input, output, roundKey);
+        fwrite(output, 1, 16, stdout);
     }
 
-    return EXIT_SUCCESS;
+    return 0;
 }
