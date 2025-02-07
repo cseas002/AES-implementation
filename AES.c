@@ -3,30 +3,21 @@
 #include <stdint.h>
 #include <string.h>
 #include <getopt.h> // For parsing command-line arguments
+#include <time.h>   // For clock_gettime
+#include <unistd.h> // For sleep
+#ifdef __linux__
+#include <sys/mman.h> // For mlock
+#endif
 
-#define Nb 4        // Number of culumns. Basically number of words in a block
-#define KEY_WORDS 4 // Number of words in the key. Key size / 32
-#define ROUNDS 10   // Number of rounds. For AES-128 it's always 10
-#define WORD_SIZE 4 // The word size
+#define NUM_ACCESSES 10000000 // Increase to get better timing resolution
+#define Nb 4                  // Number of culumns. Basically number of words in a block
+#define KEY_WORDS 4           // Number of words in the key. Key size / 32
+#define ROUNDS 10             // Number of rounds. For AES-128 it's always 10
+#define WORD_SIZE 4           // The word size
 
-void PrimeSBoxCache()
-{
-    volatile uint8_t dummy = 0;
-    for (int i = 0; i < 256; i++)
-    {
-        dummy ^= sbox[i]; // Ensure memory access
-    }
-}
-
-void print_hex(const char *label, const uint8_t *data, size_t len)
-{
-    printf("%s: ", label);
-    for (size_t i = 0; i < len; i++)
-        printf("%02x ", data[i]);
-    printf("\n");
-}
-
-static const uint8_t sbox[256] = {
+// Save as bytes for 1) less space and 2) more secure. RAM is read word-by-word, and now the attacker
+// is not certain which data is accessed, it could be one of the four bytes in the word
+const uint8_t sbox[256] = {
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
     0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
@@ -44,12 +35,125 @@ static const uint8_t sbox[256] = {
     0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16};
 
+uint8_t randomized_sbox[256];
+int randomized_sbox_offsets[256];
+
 static const uint8_t rcon[10] = {
     0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36};
 
+// Helper function to find the index of a value in the original sbox
+int find_randomized_sbox_index(uint8_t value)
+{
+    for (int i = 0; i < 256; i++)
+    {
+        if (randomized_sbox[i] == value)
+        {
+            return i;
+        }
+    }
+    return -1; // This should never happen if the sbox is correct
+}
+
+// Fisher-Yates shuffle to randomize the S-box
+void randomize_sbox()
+{
+    // Step 1: Copy the original sbox into the randomized_sbox
+    for (int i = 0; i < 256; i++)
+    {
+        randomized_sbox[i] = sbox[i];
+    }
+
+    // Step 2: Shuffle randomized_sbox using Fisher-Yates algorithm
+    srand(time(NULL)); // Seed the random number generator
+    for (int i = 255; i > 0; i--)
+    {
+        int j = rand() % (i + 1); // Random index from 0 to i
+        // Swap randomized_sbox[i] and randomized_sbox[j]
+        uint8_t temp = randomized_sbox[i];
+        randomized_sbox[i] = randomized_sbox[j];
+        randomized_sbox[j] = temp;
+    }
+
+    // Step 3: Calculate the offsets for each entry
+    for (int i = 0; i < 256; i++)
+    {
+        randomized_sbox_offsets[i] = (find_randomized_sbox_index(sbox[i]) - i) % 256;
+        // sbox[i] = randomized_sbox[randomized_sbox_offsets[i] + i];
+    }
+
+    // This way, sbox[i] = randomized_sbox[i + randomized_sbox_offsets[i] % 256]
+    for (int i = 0; i < 256; i++)
+    {
+        if (sbox[i] != randomized_sbox[randomized_sbox_offsets[i] + i])
+        {
+            printf("Randomized S-Box is not correct!\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+void PrimeSBoxCache()
+{
+    volatile uint8_t dummy = 0;
+    for (int i = 0; i < 256; i++)
+    {
+        dummy ^= sbox[i]; // Ensure memory access
+    }
+}
+
+// Function to lock the S-Box in memory to prevent swapping to disk
+void lock_sbox_in_memory()
+{
+// Paging (Swapping to Disk): If the OS swaps memory pages to disk,
+// an attacker with access to the swap file could retrieve sensitive data
+// Also, if the access time is too long, the attacker could understand that it's in the disk
+#ifdef __linux__
+    // Use mlock to lock the S-Box array in memory
+    if (mlock(sbox, sizeof(sbox)) != 0)
+    {
+        perror("mlock failed");
+        exit(EXIT_FAILURE);
+    }
+    printf("SBox locked in memory!\n");
+#else
+    printf("mlock not supported on this OS!\n");
+#endif
+}
+
+void flush_sbox_from_cache()
+{
+    __builtin___clear_cache((char *)sbox, (char *)sbox + sizeof(sbox));
+    sleep(1); // Sleep for a second to ensure the cache is flushed
+    printf("\nSBox flushed from cache!\n");
+}
+
+// Function to measure average access time to S-Box
+void measure_sbox_access_time()
+{
+    struct timespec start, end;
+    volatile uint8_t temp;
+
+    double total_time = 0;
+    for (int i = 0; i < 256; i++)
+    {
+        // If I measure only one access times, the result is 0 ns, so I measure a total of multiple access times
+        clock_gettime(CLOCK_MONOTONIC, &start); // Start timing
+        for (int j = 0; j < NUM_ACCESSES; j++)
+            temp = sbox[i];                   // Access all S-Box values
+        clock_gettime(CLOCK_MONOTONIC, &end); // End timing
+
+        double time_ns = (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec);
+        double avg_time = time_ns / NUM_ACCESSES; // Compute average time per access
+
+        total_time += avg_time;
+        // printf("S-Box access time for position %d: %.2f ns\n", i, avg_time);
+    }
+    printf("\nAverage S-Box access time for: %.2f ns\n", total_time / 256);
+}
+
 // https://en.wikipedia.org/wiki/AES_key_schedule
 // https://engineering.purdue.edu/kak/compsec/NewLectures/Lecture8.pdf
-void KeyExpansion(uint8_t *RoundKey, const uint8_t *Key)
+void KeyExpansion(uint8_t *RoundKey, const uint8_t *Key, int use_randomized_sbox)
 {
     unsigned i, j, k;
     uint8_t previous_word[4]; // Used for the core
@@ -86,7 +190,8 @@ void KeyExpansion(uint8_t *RoundKey, const uint8_t *Key)
             // SubWord (Substitute each byte in the word)
             for (j = 0; j < WORD_SIZE; j++)
             {
-                previous_word[j] = sbox[previous_word[j]];
+                uint8_t index = previous_word[j];
+                previous_word[j] = !use_randomized_sbox ? sbox[index] : randomized_sbox[index + randomized_sbox_offsets[index]];
             }
 
             // XOR only the first byte with initially the first byte of
@@ -120,13 +225,14 @@ void AddRoundKey(uint8_t round, uint8_t state[4][4], const uint8_t *RoundKey)
     }
 }
 
-void SubBytes(uint8_t state[4][4])
+void SubBytes(uint8_t state[4][4], int use_randomized_sbox)
 {
     for (uint8_t i = 0; i < 4; i++)
     {
         for (uint8_t j = 0; j < 4; j++)
         {
-            state[i][j] = sbox[state[i][j]];
+            uint8_t index = state[i][j];
+            state[i][j] = !use_randomized_sbox ? sbox[index] : randomized_sbox[index + randomized_sbox_offsets[index]];
         }
     }
 }
@@ -157,6 +263,34 @@ void ShiftRows(uint8_t state[4][4])
     state[3][1] = state[3][0];
     state[3][0] = temp;
 }
+
+// // Inverse ShiftRows (rotates rows to the right instead of left)
+// void InvShiftRows(uint8_t state[4][4])
+// {
+//     uint8_t temp;
+
+//     // Row 1: Rotate right by 1
+//     temp = state[1][3];
+//     state[1][3] = state[1][2];
+//     state[1][2] = state[1][1];
+//     state[1][1] = state[1][0];
+//     state[1][0] = temp;
+
+//     // Row 2: Rotate right by 2
+//     temp = state[2][3];
+//     state[2][3] = state[2][1];
+//     state[2][1] = temp;
+//     temp = state[2][2];
+//     state[2][2] = state[2][0];
+//     state[2][0] = temp;
+
+//     // Row 3: Rotate right by 3
+//     temp = state[3][0];
+//     state[3][0] = state[3][1];
+//     state[3][1] = state[3][2];
+//     state[3][2] = state[3][3];
+//     state[3][3] = temp;
+// }
 
 // Function to multiply a value by 2 in GF(2^8)
 uint8_t MultiplyBy2(uint8_t x)
@@ -193,7 +327,7 @@ void MixColumns(uint8_t state[4][4])
     }
 }
 
-void Cipher(uint8_t *input, uint8_t *output, const uint8_t *RoundKey, int encrypt)
+void Cipher(uint8_t *input, uint8_t *output, const uint8_t *RoundKey, int encrypt, int use_randomized_sbox)
 {
     uint8_t state[4][4];
 
@@ -212,31 +346,34 @@ void Cipher(uint8_t *input, uint8_t *output, const uint8_t *RoundKey, int encryp
 
         for (uint8_t round = 1; round < ROUNDS; round++)
         {
-            SubBytes(state);
+            SubBytes(state, use_randomized_sbox);
             ShiftRows(state);
             MixColumns(state);
             AddRoundKey(round, state, RoundKey);
         }
 
-        SubBytes(state);
+        SubBytes(state, use_randomized_sbox);
         ShiftRows(state);
         AddRoundKey(ROUNDS, state, RoundKey);
     }
     else
     {
-        // For decryption, we need to start with the last round key
+        printf("Decryption not implemented!\n");
+        exit(EXIT_SUCCESS);
+        // For decryption, we need to start with the last round key, and use the inverse functions
+        // not implemented
 
-        // I need to implement the inverse of the functions
+        // // I need to implement the inverse of the functions
         // AddRoundKey(ROUNDS, state, RoundKey);
-        // ShiftRows(state);
-        // SubBytes(state);
+        // InvShiftRows(state);
+        // InvSubBytes(state, use_randomized_sbox);
 
         // for (uint8_t round = ROUNDS - 1; round >= 1; round--)
         // {
         //     AddRoundKey(round, state, RoundKey);
-        //     MixColumns(state);
-        //     ShiftRows(state);
-        //     SubBytes(state);
+        //     InvMixColumns(state);
+        //     InvShiftRows(state);
+        //     InvSubBytes(state, use_randomized_sbox);
         // }
 
         // AddRoundKey(0, state, RoundKey);
@@ -256,7 +393,8 @@ void Cipher(uint8_t *input, uint8_t *output, const uint8_t *RoundKey, int encryp
 int main(int argc, char *argv[])
 {
     int opt;
-    int mode_encrypt = -1; // -1 means mode not set, 0 = decrypt, 1 = encrypt
+    int mode_encrypt = -1;       // -1 means mode not set, 0 = decrypt, 1 = encrypt
+    int use_randomized_sbox = 0; // 0 = default SBOX, 1 = randomized SBOX
     const char *input_file_name = NULL;
     const char *output_file_name = NULL;
     const char *key_file_name = NULL;
@@ -266,7 +404,7 @@ int main(int argc, char *argv[])
     uint8_t key[16];       // 16 bytes for the key
 
     // Parse command-line arguments
-    while ((opt = getopt(argc, argv, "i:o:k:ed")) != -1)
+    while ((opt = getopt(argc, argv, "i:o:k:ed:r")) != -1)
     {
         switch (opt)
         {
@@ -285,64 +423,72 @@ int main(int argc, char *argv[])
         case 'd': // Decryption mode
             mode_encrypt = 0;
             break;
+        case 'r': // Randomization of sbox
+            // Instead of accessing the SBox, we will access the randomized SBox which containes the same values as the
+            // original SBox. The difference is that the values are shuffled.
+            randomize_sbox();
+            use_randomized_sbox = 1;
+            break;
         default:
-            fprintf(stderr, "Usage: %s -i <input_file> -o <output_file> -k <key_file> -e|-d\n", argv[0]);
+            fprintf(stderr, "Usage: %s -i <input_file> -o <output_file> -k <key_file> -e|-d -r \n", argv[0]);
             return EXIT_FAILURE;
         }
     }
 
     PrimeSBoxCache(); // Prime the cache with SBOX values
+    lock_sbox_in_memory();
 
     if (input_file_name == NULL && output_file_name == NULL && key_file_name == NULL && mode_encrypt == -1)
     {
         printf("Reading from input, with key+payload: \n");
         // Read key from standard input
         fread(key, 1, 16, stdin); // 1 is the size of each element, here it's one byte, total of 16 bytes
-        KeyExpansion(roundKey, key);
+        KeyExpansion(roundKey, key, use_randomized_sbox);
 
         // Read and encrypt blocks
         while (fread(input, 1, 16, stdin) == 16)
         {
-            Cipher(input, output, roundKey, 1);
+            Cipher(input, output, roundKey, 1, use_randomized_sbox);
             fwrite(output, 1, 16, stdout);
         }
-
-        return 0;
+        printf("\n");
     }
-
-    // Validate required arguments
-    if (input_file_name == NULL || output_file_name == NULL || key_file_name == NULL || mode_encrypt == -1)
+    else
     {
-        fprintf(stderr, "Usage: %s -i <input_file> -o <output_file> -k <key_file> -e|-d\n", argv[0]);
-        return EXIT_FAILURE;
+
+        // Validate required arguments
+        if (input_file_name == NULL || output_file_name == NULL || key_file_name == NULL || mode_encrypt == -1)
+        {
+            fprintf(stderr, "Usage: %s -i <input_file> -o <output_file> -k <key_file> -e|-d\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+
+        FILE *key_file = fopen(key_file_name, "rb");       // Open the key file in binary mode
+        FILE *input_file = fopen(input_file_name, "rb");   // Open the key file in binary mode
+        FILE *output_file = fopen(output_file_name, "wb"); // Open the key file in binary mode
+        if (!(key_file && input_file && output_file))
+        {
+            fprintf(stderr, "Error: Could not open files \n");
+            return EXIT_FAILURE; // Exit if the file could not be opened
+        }
+
+        // printf("%s %s %s %d\n", input_file_name, output_file_name, key_file_name, mode_encrypt);
+
+        // Read key from the key file
+        fread(key, 1, 16, key_file); // 1 is the size of each element, here it's one byte, total of 16 bytes
+        KeyExpansion(roundKey, key, use_randomized_sbox);
+
+        // Read and encrypt blocks
+        while (fread(input, 1, 16, input_file) == 16)
+        {
+            Cipher(input, output, roundKey, mode_encrypt, use_randomized_sbox);
+            fwrite(output, 1, 16, output_file);
+        }
     }
 
-    FILE *key_file = fopen(key_file_name, "rb");       // Open the key file in binary mode
-    FILE *input_file = fopen(input_file_name, "rb");   // Open the key file in binary mode
-    FILE *output_file = fopen(output_file_name, "wb"); // Open the key file in binary mode
-    if (!(key_file && input_file && output_file))
-    {
-        fprintf(stderr, "Error: Could not open files \n");
-        return EXIT_FAILURE; // Exit if the file could not be opened
-    }
-
-    // printf("%s %s %s %d\n", input_file_name, output_file_name, key_file_name, mode_encrypt);
-
-    // return 0;
-
-    // Read key from the key file
-    fread(key, 1, 16, key_file); // 1 is the size of each element, here it's one byte, total of 16 bytes
-    KeyExpansion(roundKey, key);
-
-    // // Reset the file pointer to the beginning
-    // fseek(input_file_name, 0, SEEK_SET);
-
-    // Read and encrypt blocks
-    while (fread(input, 1, 16, input_file) == 16)
-    {
-        Cipher(input, output, roundKey, mode_encrypt);
-        fwrite(output, 1, 16, output_file);
-    }
+    // measure_sbox_access_time();
+    flush_sbox_from_cache();
+    // measure_sbox_access_time();
 
     return EXIT_SUCCESS;
 }
